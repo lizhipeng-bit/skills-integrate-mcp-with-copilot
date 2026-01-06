@@ -5,7 +5,11 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from email.message import EmailMessage
+import smtplib
+from typing import Dict
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
@@ -88,8 +92,86 @@ def get_activities():
     return activities
 
 
+def _get_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+class EmailSettings:
+    def __init__(self) -> None:
+        self.host = os.getenv("SMTP_HOST")
+        self.port = _get_int_env("SMTP_PORT", 587)
+        self.username = os.getenv("SMTP_USERNAME")
+        self.password = os.getenv("SMTP_PASSWORD")
+        self.from_email = os.getenv("FROM_EMAIL")
+        self.from_name = os.getenv("FROM_NAME", "Mergington High School Activities")
+        # Default to TLS for common SMTP setups
+        self.use_tls = os.getenv("SMTP_USE_TLS", "true").lower() != "false"
+
+    @property
+    def sender(self) -> str:
+        if self.from_name and self.from_email:
+            return f"{self.from_name} <{self.from_email}>"
+        return self.from_email or ""
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.host and self.port and self.from_email)
+
+
+email_settings = EmailSettings()
+
+
+def send_email(subject: str, body: str, to_email: str) -> None:
+    """Send an email using configured SMTP settings."""
+    if not email_settings.is_configured:
+        print("Email settings not configured; skipping email send.")
+        return
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = email_settings.sender
+    message["To"] = to_email
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP(email_settings.host, email_settings.port) as server:
+            if email_settings.use_tls:
+                server.starttls()
+            if email_settings.username and email_settings.password:
+                server.login(email_settings.username, email_settings.password)
+            server.send_message(message)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Failed to send email to {to_email}: {exc}")
+
+
+def _registration_email_body(activity_name: str, activity: Dict, student_email: str) -> str:
+    return (
+        "Registration Confirmation\n"
+        "---------------------------\n"
+        f"Student: {student_email}\n"
+        f"Activity: {activity_name}\n"
+        f"Schedule: {activity.get('schedule', 'TBD')}\n"
+        f"Location: {activity.get('location', 'On campus')}\n\n"
+        "You are successfully registered. If you need to cancel, use the unregister option on the site."
+    )
+
+
+def _cancellation_email_body(activity_name: str, activity: Dict, student_email: str) -> str:
+    return (
+        "Cancellation Confirmation\n"
+        "---------------------------\n"
+        f"Student: {student_email}\n"
+        f"Activity: {activity_name}\n"
+        f"Schedule: {activity.get('schedule', 'TBD')}\n\n"
+        "Your registration has been cancelled. You can re-register anytime if spots are available."
+    )
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, background_tasks: BackgroundTasks):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -107,11 +189,19 @@ def signup_for_activity(activity_name: str, email: str):
 
     # Add student
     activity["participants"].append(email)
+
+    background_tasks.add_task(
+        send_email,
+        subject=f"Successfully Registered for {activity_name}",
+        body=_registration_email_body(activity_name, activity, email),
+        to_email=email,
+    )
+
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, background_tasks: BackgroundTasks):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -129,4 +219,12 @@ def unregister_from_activity(activity_name: str, email: str):
 
     # Remove student
     activity["participants"].remove(email)
+
+    background_tasks.add_task(
+        send_email,
+        subject=f"Activity Registration Cancelled - {activity_name}",
+        body=_cancellation_email_body(activity_name, activity, email),
+        to_email=email,
+    )
+
     return {"message": f"Unregistered {email} from {activity_name}"}
